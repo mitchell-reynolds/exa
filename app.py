@@ -1,272 +1,378 @@
+import re
+
 import streamlit as st
 import pandas as pd
-import json
-from mock_exa import MockExaClient
+import os
+from exa_py import Exa
+from dotenv import load_dotenv
 
-# Page Config
+# ---------------------------------------------------------------------------
+# Config & Initialization
+# ---------------------------------------------------------------------------
+load_dotenv()
+
 st.set_page_config(
-    page_title="Outsource Partner Scout",
+    page_title="Exa AI — Biotech Research",
     page_icon="🧬",
-    layout="wide"
+    layout="wide",
 )
 
-# Initialize Client
+
 @st.cache_resource
-def get_client():
-    return MockExaClient()
+def get_exa_client():
+    """Return a cached Exa client. Raises if the API key is missing."""
+    api_key = os.getenv("EXA_API_KEY")
+    if not api_key:
+        return None
+    return Exa(api_key)
 
-client = get_client()
 
+exa = get_exa_client()
+
+# ---------------------------------------------------------------------------
 # Header
-st.title("🧬 Outsource Partner Scout")
-st.markdown("""
-**Find the perfect CRO/CDMO partner for your biotech program.**
-Powered by Exa AI - Discovery & Enrichment Layer.
-""")
+# ---------------------------------------------------------------------------
+st.title("🧬 Exa AI — Biotech Research Assistant")
+st.markdown(
+    "Enter a research question below and get an **executive summary** "
+    "plus a **ranked table** of the most relevant sources across papers, "
+    "news, social media, and more."
+)
 
-# Sidebar - Program Requirements
+if exa is None:
+    st.error(
+        "**EXA_API_KEY not found.** "
+        "Create a `.env` file in the project root with:\n\n"
+        "```\nEXA_API_KEY=your_key_here\n```"
+    )
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Sidebar — Query Controls
+# ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("1. Program Requirements")
+    st.header("🔬 Research Query")
 
-    vendor_type = st.radio(
-        "Vendor Type",
-        ["Both", "CRO", "CDMO"],
-        help="Select the type of partner you are looking for."
+    query = st.text_area(
+        "What are you researching?",
+        placeholder="e.g. Latest mRNA vaccine delivery platform innovations",
+        height=120,
     )
-
-    st.subheader("Modality")
-    modalities = st.multiselect(
-        "Select Modality(s)",
-        ["Small Molecule", "Large Molecule", "Antibody", "ADC", "Peptide",
-         "Oligonucleotide", "mRNA", "Viral Vector", "Cell Therapy", "Gene Therapy", "Plasmid DNA"],
-        default=[]
-    )
-
-    st.subheader("Stage")
-    stage = st.selectbox(
-        "Development Stage",
-        ["Discovery", "Preclinical", "Phase I", "Phase II", "Phase III", "Commercial"]
-    )
-
-    st.subheader("Scope of Work")
-    scope_options = [
-        "Bioanalytical", "Tox", "Safety Pharm", "Clinical Ops", "Regulatory", # CRO
-        "Process Dev", "Cell Line Dev", "GMP Drug Substance", "GMP Drug Product",
-        "Fill Finish", "QC Release", "Stability", "Logistics" # CDMO
-    ]
-    scope = st.multiselect("Select Services Needed", scope_options)
-
-    st.subheader("Quality & Compliance")
-    quality_reqs = st.multiselect(
-        "Quality Standards",
-        ["GLP", "GCP", "GMP", "ISO 9001", "ISO 13485", "Aseptic", "Sterile", "Cold Chain"]
-    )
-
-    st.subheader("Geography")
-    geo_pref = st.selectbox(
-        "Preferred Region",
-        ["Any", "US - East Coast", "US - West Coast", "US - Midwest", "EU", "APAC", "Global"]
-    )
-
-    st.subheader("Timeline")
-    timeline = st.text_input("Timeline Requirement", placeholder="e.g. Need slot within 90 days")
 
     st.markdown("---")
-    # Store search inputs in session state to persist across reruns
-    if st.button("Find Partners", type="primary"):
-        st.session_state.search_triggered = True
-        st.session_state.search_query = {
-            "vendor_type": vendor_type,
-            "modalities": modalities,
-            "stage": stage,
-            "scope": scope,
-            "quality": quality_reqs,
-            "geo": geo_pref,
-            "timeline": timeline
-        }
+    st.subheader("Filters")
 
-# Logic Functions
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Published after", value=None)
+    with col2:
+        end_date = st.date_input("Published before", value=None)
 
-def construct_exa_query(inputs):
-    """Constructs a natural language query for Exa based on inputs."""
-    query_parts = []
+    num_results = st.slider(
+        "Results per category",
+        min_value=3,
+        max_value=15,
+        value=5,
+        help="Number of results to retrieve per source category "
+        "(paper, news, tweet, general). Total results will be up to 4× this.",
+    )
 
-    if inputs["vendor_type"] != "Both":
-        query_parts.append(inputs["vendor_type"])
+    st.markdown("---")
+    search_clicked = st.button("🔍 Search", type="primary", width="stretch")
 
-    if inputs["modalities"]:
-        query_parts.append(" ".join(inputs["modalities"]))
+# ---------------------------------------------------------------------------
+# Search helpers
+# ---------------------------------------------------------------------------
 
-    if inputs["scope"]:
-        query_parts.append(" ".join(inputs["scope"]))
+# Category passes: (label, category kwarg, search type)
+SEARCH_PASSES = [
+    ("Paper", "research paper", "auto"),
+    ("News", "news", "auto"),
+    ("Tweet", "tweet", "auto"),
+    ("Other", None, "auto"),  # catch-all for conferences, blogs, transcripts, etc.
+]
 
-    if inputs["quality"]:
-        query_parts.append(" ".join(inputs["quality"]))
 
-    if inputs["geo"] != "Any":
-        query_parts.append(inputs["geo"])
+def _clean_text(raw: str) -> str:
+    """Strip web-scraping noise from Exa extracted text."""
+    if not raw:
+        return ""
+    # Remove markdown images / broken image refs  e.g. ![alt](url), [![...]], ![]
+    text = re.sub(r"!\[[^\]]*\](?:\([^)]*\))?", "", raw)
+    # Remove standalone markdown link brackets used as nav items  e.g. [Dashboard]
+    text = re.sub(r"^\s*\[[^\]]{1,40}\]\s*$", "", text, flags=re.MULTILINE)
+    # Remove common boilerplate lines
+    boilerplate = [
+        "Skip to main content", "Skip to article", "Skip to navigation",
+        "An official website of the United States government",
+        "Here's how you know", "Official websites use .gov",
+        "Secure .gov websites use HTTPS", "NCBI home page",
+        "Log out", "Search NCBI", "Search PMC",
+        "BMC journals have moved to Springer Nature Link",
+    ]
+    for phrase in boilerplate:
+        text = text.replace(phrase, "")
+    # Collapse excessive whitespace / blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
-    if inputs["timeline"]:
-        query_parts.append(inputs["timeline"])
 
-    return " ".join(query_parts)
+def _build_date_kwargs(start, end):
+    """Convert optional date inputs to ISO strings for the Exa API."""
+    kwargs = {}
+    if start:
+        kwargs["start_published_date"] = start.isoformat() + "T00:00:00.000Z"
+    if end:
+        kwargs["end_published_date"] = end.isoformat() + "T23:59:59.000Z"
+    return kwargs
 
-# Main Area Logic
+
+def run_multi_pass_search(query_text, n_per_pass, start, end):
+    """Execute 4 category-specific searches and return combined, deduplicated rows."""
+    date_kwargs = _build_date_kwargs(start, end)
+    all_rows = []
+    seen_urls = set()
+
+    for label, category, search_type in SEARCH_PASSES:
+        try:
+            kwargs = dict(
+                query=query_text,
+                type=search_type,
+                num_results=n_per_pass,
+                contents={"text": True},
+                **date_kwargs,
+            )
+            if category is not None:
+                kwargs["category"] = category
+
+            response = exa.search(**kwargs)
+
+            for r in response.results:
+                url = getattr(r, "url", None) or ""
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+
+                raw_text = getattr(r, "text", "") or ""
+                text = _clean_text(raw_text)
+                summary = text[:300].strip()
+                if len(text) > 300:
+                    summary += "…"
+
+                all_rows.append(
+                    {
+                        "Title": getattr(r, "title", "Untitled") or "Untitled",
+                        "URL": url,
+                        "Category": label,
+                        "Published": getattr(r, "published_date", None) or "",
+                        "Author": getattr(r, "author", None) or "",
+                        "Summary": summary,
+                        "_full_text": text,
+                    }
+                )
+        except Exception as e:
+            # Silently skip a failing category pass so other passes still return
+            st.toast(f"⚠️ {label} search encountered an issue: {e}", icon="⚠️")
+
+    return all_rows
+
+
+# ---------------------------------------------------------------------------
+# Main Area — Results
+# ---------------------------------------------------------------------------
+
+if search_clicked and query:
+    # Store in session state so results persist across reruns
+    st.session_state["query"] = query
+    st.session_state["search_triggered"] = True
+    st.session_state["start_date"] = start_date
+    st.session_state["end_date"] = end_date
+    st.session_state["num_results"] = num_results
+elif search_clicked and not query:
+    st.warning("Please enter a research question in the sidebar.")
 
 if st.session_state.get("search_triggered"):
-    inputs = st.session_state.search_query
+    q = st.session_state["query"]
 
-    query = construct_exa_query(inputs)
+    # ------------------------------------------------------------------
+    # Section A — Executive Summary (streamed)
+    # ------------------------------------------------------------------
+    st.header("📝 Executive Summary")
+    summary_container = st.container()
+    with summary_container:
+        try:
+            _summary_parts = []
 
-    with st.spinner(f"Scanning the web for '{query}'..."):
-        # Simulated API Call
-        response = client.search_and_contents(
-            query,
-            type=inputs["vendor_type"],
-            num_results=10
+            def _text_chunks(stream):
+                """Yield only the readable text from stream_answer chunks."""
+                for chunk in stream:
+                    if isinstance(chunk, str):
+                        _summary_parts.append(chunk)
+                        yield chunk
+                    elif hasattr(chunk, "content") and chunk.content:
+                        _summary_parts.append(chunk.content)
+                        yield chunk.content
+                    elif hasattr(chunk, "text") and chunk.text:
+                        _summary_parts.append(chunk.text)
+                        yield chunk.text
+
+            stream = exa.stream_answer(q, text=True)
+            st.write_stream(_text_chunks(stream))
+            st.session_state["exec_summary"] = "".join(_summary_parts)
+        except Exception as e:
+            st.error(f"Could not generate executive summary: {e}")
+
+    st.markdown("---")
+
+    # ------------------------------------------------------------------
+    # Section B — Ranked Results Table (multi-pass)
+    # ------------------------------------------------------------------
+    st.header("📊 Source Results")
+
+    with st.spinner("Searching across papers, news, tweets, and more…"):
+        rows = run_multi_pass_search(
+            q,
+            st.session_state["num_results"],
+            st.session_state.get("start_date"),
+            st.session_state.get("end_date"),
         )
-        results = response["results"]
 
-    if not results:
-        st.warning("No partners found matching your specific criteria. Try broadening your search.")
+    if not rows:
+        st.warning(
+            "No results found. Try broadening your query or adjusting the date range."
+        )
     else:
-        # Prepare Data for Display
-        data_rows = []
-        for r in results:
-            meta = r["custom_metadata"]
-            data_rows.append({
-                "Vendor Name": meta["vendor_name"],
-                "Type": meta["vendor_type"],
-                "Modality": ", ".join(meta["modalities"]),
-                "Scope": ", ".join(meta["scope"]),
-                "Quality": ", ".join(meta["quality"]),
-                "Location": meta["geo"],
-                "Timeline": meta["timeline"],
-                "Evidence": r["url"],
-                "Highlight": r["highlights"][0],
-                "Score": r["score"],
-                "Full Text": r["text"],
-                "id": r["id"]
-            })
+        df = pd.DataFrame(rows)
 
-        df = pd.DataFrame(data_rows)
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Sources", len(df))
+        col2.metric("Papers", len(df[df["Category"] == "Paper"]))
+        col3.metric("News", len(df[df["Category"] == "News"]))
+        col4.metric("Tweets + Other", len(df[df["Category"].isin(["Tweet", "Other"])]))
 
-        # Tabs for different views
-        tab1, tab2, tab3 = st.tabs(["📋 Shortlist", "🔍 Vendor Deep Dive", "⚖️ Compare"])
+        # Interactive table
+        st.dataframe(
+            df[["Title", "URL", "Category", "Published", "Author", "Summary"]],
+            column_config={
+                "URL": st.column_config.LinkColumn("URL", display_text="Open"),
+            },
+            width="stretch",
+            hide_index=True,
+        )
 
-        with tab1:
-            st.subheader(f"Found {len(results)} Potential Partners")
-            st.dataframe(
-                df[["Vendor Name", "Type", "Modality", "Scope", "Quality", "Location", "Timeline"]],
-                use_container_width=True,
-                hide_index=True
-            )
+        # Expandable full-text previews
+        st.subheader("🔎 Full Text Previews")
+        for _, row in df.iterrows():
+            with st.expander(f"[{row['Category']}] {row['Title']}"):
+                st.caption(f"Source: {row['URL']}")
+                if row["Author"]:
+                    st.caption(f"Author: {row['Author']}")
+                st.text(row["_full_text"][:2000] if row["_full_text"] else "No text available.")
 
-            # Export Buttons
-            c1, c2 = st.columns([1, 10])
-            with c1:
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name='vendor_shortlist.csv',
-                    mime='text/csv',
-                )
-            with c2:
-                json_str = df.to_json(orient="records")
-                st.download_button(
-                    label="Download JSON",
-                    data=json_str,
-                    file_name='vendor_shortlist.json',
-                    mime='application/json',
-                )
+        # --------------------------------------------------------------
+        # Section C — Deep Dive (follow-up refinement)
+        # --------------------------------------------------------------
+        st.markdown("---")
+        st.header("🔬 Deep Dive")
+        st.caption(
+            "Generate a deeper analysis based on the executive summary above, "
+            "plus discover related sources via semantic similarity."
+        )
 
-        with tab2:
-            st.subheader("Vendor Evidence Brief")
-            selected_vendor_name = st.selectbox(
-                "Select a vendor to inspect:",
-                df["Vendor Name"].tolist(),
-                key="deep_dive_select"
-            )
+        if st.button("🔬 Generate Deep Dive", type="secondary", width="stretch"):
+            exec_summary = st.session_state.get("exec_summary", "")
 
-            if selected_vendor_name:
-                selected_row = df[df["Vendor Name"] == selected_vendor_name].iloc[0]
-
-                # Header
-                c1, c2 = st.columns([3, 1])
-                with c1:
-                    st.markdown(f"## {selected_row['Vendor Name']}")
-                    st.caption(f"**{selected_row['Type']}** | {selected_row['Location']}")
-                with c2:
-                    st.metric("Fit Score", f"{selected_row['Score']:.1f}/5.0")
-
-                st.markdown("---")
-
-                # Claims vs Requirements
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("#### ✅ Capability Match")
-                    # Logic to check matches
-                    matched_modalities = [m for m in inputs["modalities"] if m in selected_row["Modality"]]
-                    matched_scope = [s for s in inputs["scope"] if s in selected_row["Scope"]]
-                    matched_quality = [q for q in inputs["quality"] if q in selected_row["Quality"]]
-
-                    if matched_modalities:
-                        st.success(f"**Modalities:** {', '.join(matched_modalities)}")
-                    if matched_scope:
-                        st.success(f"**Services:** {', '.join(matched_scope)}")
-                    if matched_quality:
-                        st.success(f"**Quality:** {', '.join(matched_quality)}")
-
-                    if not (matched_modalities or matched_scope or matched_quality):
-                        st.info("No direct keyword match on selected criteria, but contextually relevant.")
-
-                with c2:
-                    st.markdown("#### ⚠️ Risk Signals")
-                    if selected_row['Score'] < 4.0:
-                        st.warning("Low relevance score suggests potential capability gap or outdated info.")
-                        # Random risk signal for demo
-                        st.error("Recent facility warning letter (simulated)")
-                    else:
-                        st.success("No adverse regulatory actions found in last 12 months.")
-
-                st.markdown("#### 📄 Exa Evidence Source")
-                st.info(f"**Excerpt:** \"{selected_row['Highlight']}\"")
-                st.markdown(f"**Source URL:** [{selected_row['Evidence']}]({selected_row['Evidence']})")
-
-                with st.expander("View Full Extracted Text"):
-                    st.write(selected_row["Full Text"])
-
-        with tab3:
-            st.subheader("Side-by-Side Comparison")
-
-            compare_vendors = st.multiselect(
-                "Select vendors to compare (max 4):",
-                df["Vendor Name"].tolist(),
-                default=df["Vendor Name"].tolist()[:2],
-                max_selections=4
-            )
-
-            if compare_vendors:
-                # Filter dataframe
-                comp_df = df[df["Vendor Name"].isin(compare_vendors)].set_index("Vendor Name")
-                # Transpose for comparison
-                comp_df_t = comp_df[["Type", "Modality", "Scope", "Quality", "Location", "Timeline", "Score"]].transpose()
-                st.dataframe(comp_df_t, use_container_width=True)
+            if not exec_summary:
+                st.warning("No executive summary available to refine. Please run a search first.")
             else:
-                st.info("Select at least one vendor to compare.")
+                # -- Deep Dive Summary --
+                st.subheader("📖 Deeper Analysis")
+                refined_prompt = (
+                    f'Based on this research summary about "{q}":\n\n'
+                    f"{exec_summary}\n\n"
+                    "Provide a deeper analysis covering:\n"
+                    "- Key gaps or unanswered questions in the current research\n"
+                    "- Emerging trends or breakthroughs that may be underreported\n"
+                    "- Contrarian or alternative viewpoints\n"
+                    "- Specific recent developments (conferences, preprints, clinical trials) not covered above"
+                )
+                try:
+                    deep_parts = []
+
+                    def _deep_chunks(stream):
+                        for chunk in stream:
+                            if isinstance(chunk, str):
+                                deep_parts.append(chunk)
+                                yield chunk
+                            elif hasattr(chunk, "content") and chunk.content:
+                                deep_parts.append(chunk.content)
+                                yield chunk.content
+                            elif hasattr(chunk, "text") and chunk.text:
+                                deep_parts.append(chunk.text)
+                                yield chunk.text
+
+                    deep_stream = exa.stream_answer(refined_prompt, text=True)
+                    st.write_stream(_deep_chunks(deep_stream))
+                except Exception as e:
+                    st.error(f"Deep dive analysis failed: {e}")
+
+                # -- Related Sources via find_similar --
+                st.subheader("🔗 Related Sources")
+                top_url = df.iloc[0]["URL"] if len(df) > 0 else None
+                if top_url:
+                    try:
+                        with st.spinner("Finding semantically similar sources…"):
+                            similar = exa.find_similar_and_contents(
+                                top_url,
+                                num_results=5,
+                                text=True,
+                            )
+                        if similar.results:
+                            sim_rows = []
+                            for r in similar.results:
+                                text = getattr(r, "text", "") or ""
+                                snippet = text[:200].strip()
+                                if len(text) > 200:
+                                    snippet += "…"
+                                sim_rows.append({
+                                    "Title": getattr(r, "title", "Untitled") or "Untitled",
+                                    "URL": getattr(r, "url", "") or "",
+                                    "Snippet": snippet,
+                                })
+                            sim_df = pd.DataFrame(sim_rows)
+                            st.dataframe(
+                                sim_df,
+                                column_config={
+                                    "URL": st.column_config.LinkColumn("URL", display_text="Open"),
+                                },
+                                width="stretch",
+                                hide_index=True,
+                            )
+                        else:
+                            st.info("No similar sources found.")
+                    except Exception as e:
+                        st.error(f"Could not find similar sources: {e}")
+                else:
+                    st.info("No top result URL available for similarity search.")
 
 else:
-    st.info("👈 Please define your program requirements in the sidebar and click **Find Partners**.")
+    # Landing state
+    st.info("👈 Enter your research question in the sidebar and click **Search**.")
 
     st.subheader("How it works")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown("#### 1. Define")
-        st.caption("Input your specific modality, stage, and service needs.")
+        st.markdown("#### 1. Ask")
+        st.caption("Type any biotech research question in natural language.")
     with c2:
         st.markdown("#### 2. Discover")
-        st.caption("Exa scans thousands of vendor sites, news, and reports.")
+        st.caption(
+            "Exa searches across research papers, news, tweets, conference talks, and more."
+        )
     with c3:
-        st.markdown("#### 3. Select")
-        st.caption("Compare verified capabilities and risk signals side-by-side.")
+        st.markdown("#### 3. Synthesize")
+        st.caption(
+            "Get an AI-generated executive summary and a ranked table of sources."
+        )
