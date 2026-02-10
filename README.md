@@ -21,11 +21,16 @@ Biotech R&D teams face massive risks when selecting outsourced partners (CROs/CD
 ## How to Run
 
 1.  Clone the repository.
-2.  Install dependencies:
+2.  Create and activate the [Conda](https://docs.conda.io/en/latest/) environment:
+    ```bash
+    conda create -n exa python=3.10 -y
+    conda activate exa
+    ```
+3.  Install dependencies:
     ```bash
     pip install -r requirements.txt
     ```
-3.  Run the Streamlit app:
+4.  Run the Streamlit app:
     ```bash
     streamlit run app.py
     ```
