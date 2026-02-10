@@ -18,16 +18,15 @@ st.set_page_config(
 )
 
 
-@st.cache_resource
-def get_exa_client():
-    """Return a cached Exa client. Raises if the API key is missing."""
-    api_key = os.getenv("EXA_API_KEY")
-    if not api_key:
+def get_exa_client(api_key: str):
+    """Return an Exa client for the given API key, or None if the key is empty."""
+    if not api_key or not api_key.strip():
         return None
-    return Exa(api_key)
-
-
-exa = get_exa_client()
+    try:
+        return Exa(api_key.strip())
+    except Exception as e:
+        st.error(f"Failed to initialize Exa client: {e}")
+        return None
 
 # ---------------------------------------------------------------------------
 # Header
@@ -39,18 +38,22 @@ st.markdown(
     "news, social media, and more."
 )
 
-if exa is None:
-    st.error(
-        "**EXA_API_KEY not found.** "
-        "Create a `.env` file in the project root with:\n\n"
-        "```\nEXA_API_KEY=your_key_here\n```"
-    )
-    st.stop()
-
 # ---------------------------------------------------------------------------
 # Sidebar — Query Controls
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.header("🔑 API Key")
+    user_api_key = st.text_input(
+        "Exa API Key",
+        type="password",
+        placeholder="Paste your Exa API key here",
+        help="Enter your Exa API key. This overrides any key set in `.env`.",
+    )
+
+    # Resolve the key: sidebar input takes priority, then .env
+    resolved_key = user_api_key.strip() if user_api_key else os.getenv("EXA_API_KEY", "")
+
+    st.markdown("---")
     st.header("🔬 Research Query")
 
     query = st.text_area(
@@ -79,6 +82,19 @@ with st.sidebar:
 
     st.markdown("---")
     search_clicked = st.button("🔍 Search", type="primary", width="stretch")
+
+# ---------------------------------------------------------------------------
+# Exa Client Initialization
+# ---------------------------------------------------------------------------
+exa = get_exa_client(resolved_key)
+
+if search_clicked and not exa:
+    st.error(
+        "**Exa API key is required.** "
+        "Please enter your API key in the sidebar, or set `EXA_API_KEY` in a `.env` file.\n\n"
+        "```\nEXA_API_KEY=your_key_here\n```"
+    )
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Search helpers
